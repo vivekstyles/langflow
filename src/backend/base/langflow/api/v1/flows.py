@@ -35,8 +35,13 @@ from langflow.services.database.models.flow.model import (
     FlowUpdate,
 )
 from langflow.services.database.models.flow.utils import get_webhook_component_in_flow
+
+# TODO: Full-version import/export is planned as a follow-up feature. When implemented,
+# re-add imports for create_flow_version_entry, get_flow_version_list, strip_version_data,
+# and FlowVersionError from the flow_version modules.
 from langflow.services.database.models.folder.constants import DEFAULT_FOLDER_NAME
 from langflow.services.database.models.folder.model import Folder
+from langflow.services.database.models.folder.utils import get_default_folder_id
 from langflow.services.deps import get_settings_service, get_storage_service
 from langflow.services.storage.service import StorageService
 from langflow.utils.compression import compress_response
@@ -261,13 +266,18 @@ async def _new_flow(
 
         db_flow.updated_at = datetime.now(timezone.utc)
 
-        if db_flow.folder_id is None:
-            # Make sure flows always have a folder
-            default_folder = (
-                await session.exec(select(Folder).where(Folder.name == DEFAULT_FOLDER_NAME, Folder.user_id == user_id))
+        # Validate folder_id exists, or fall back to default folder
+        if db_flow.folder_id is not None:
+            folder_exists = (
+                await session.exec(select(Folder).where(Folder.id == db_flow.folder_id, Folder.user_id == user_id))
             ).first()
-            if default_folder:
-                db_flow.folder_id = default_folder.id
+            if not folder_exists:
+                # Folder doesn't exist or doesn't belong to user, use default
+                db_flow.folder_id = None
+
+        if db_flow.folder_id is None:
+            # Make sure flows always have a folder (auto-create default folder if needed)
+            db_flow.folder_id = await get_default_folder_id(session, user_id)
 
         session.add(db_flow)
 
@@ -488,10 +498,20 @@ async def update_flow(
         db_flow.webhook = webhook_component is not None
         db_flow.updated_at = datetime.now(timezone.utc)
 
+        # Validate folder_id exists, or fall back to default folder
+        if db_flow.folder_id is not None:
+            folder_exists = (
+                await session.exec(
+                    select(Folder).where(Folder.id == db_flow.folder_id, Folder.user_id == current_user.id)
+                )
+            ).first()
+            if not folder_exists:
+                # Folder doesn't exist or doesn't belong to user, use default
+                db_flow.folder_id = None
+
         if db_flow.folder_id is None:
-            default_folder = (await session.exec(select(Folder).where(Folder.name == DEFAULT_FOLDER_NAME))).first()
-            if default_folder:
-                db_flow.folder_id = default_folder.id
+            # Make sure flows always have a folder (auto-create default folder if needed)
+            db_flow.folder_id = await get_default_folder_id(session, current_user.id)
 
         session.add(db_flow)
         await session.flush()
@@ -520,7 +540,7 @@ async def update_flow(
     return flow_read
 
 
-@router.put("/{flow_id}", response_model=FlowRead)
+@router.put("/{flow_id}", response_model=FlowRead, include_in_schema=False)
 async def upsert_flow(
     *,
     session: DbSession,
@@ -727,7 +747,12 @@ async def upload_file(
     """Upload flows from a file."""
     contents = await file.read()
     data = orjson.loads(contents)
+
     flow_list = FlowListCreate(**data) if "flows" in data else FlowListCreate(flows=[FlowCreate(**data)])
+
+    # TODO: Full-version import is planned as a follow-up feature.
+    # When implemented, extract raw flow dicts here to read embedded "version"
+    # arrays and create FlowVersion entries for each imported flow.
 
     try:
         flow_reads = []
@@ -795,6 +820,9 @@ async def download_multiple_file(
     db: DbSession,
 ):
     """Download all flows as a zip file."""
+    # TODO: Full-version download (include_version parameter) is planned as a follow-up feature.
+    # When implemented, add an include_version: bool = False parameter and embed version
+    # entries in each flow dict using get_flow_version_list and strip_version_data.
     flows = (await db.exec(select(Flow).where(and_(Flow.user_id == user.id, Flow.id.in_(flow_ids))))).all()  # type: ignore[attr-defined]
 
     if not flows:
@@ -870,7 +898,7 @@ async def read_basic_examples(
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
-@router.post("/expand/", status_code=200, dependencies=[Depends(get_current_active_user)])
+@router.post("/expand/", status_code=200, dependencies=[Depends(get_current_active_user)], include_in_schema=False)
 async def expand_compact_flow_endpoint(
     compact_data: dict,
 ):
