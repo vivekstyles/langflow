@@ -3,14 +3,17 @@
 These mirror the langflow-side regression tests in
 ``src/backend/tests/unit/test_process.py`` so the two copies of ``apply_tweaks``
 (``langflow.processing.process`` used by the API and ``lfx.processing.process``)
-cannot drift. They guard the Tweaks-API code-injection gate (CWE-94): a tweak must
-never override an executable/sandbox input, while leaving benign fields tweakable.
+cannot drift. They guard Tweaks-API security boundaries: a tweak must never
+override an executable/sandbox input or repoint a protected sink, while leaving
+benign fields tweakable.
 """
 
 from __future__ import annotations
 
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
+import pytest
+from lfx.graph.vertex.base import ParameterHandler, Vertex
 from lfx.processing.process import apply_tweaks
 from lfx.utils.flow_validation import CODE_EXECUTION_COMPONENT_TYPES, CODE_EXECUTION_FIELD_NAMES
 
@@ -29,13 +32,44 @@ def test_apply_tweaks_applies_ordinary_field():
     assert node["data"]["node"]["template"]["param1"]["value"] == "new"
 
 
+def test_apply_tweaks_blocks_sql_connection_and_query():
+    """A run caller cannot repoint the stored SQL sink or replace its query."""
+    node = _template_node(
+        {
+            "database_url": {"value": "postgresql://stored/db", "type": "str"},
+            "query": {"value": "SELECT 1", "type": "str"},
+            "include_columns": {"value": True, "type": "bool"},
+        },
+        node_type="SQLComponent",
+    )
+
+    with patch("lfx.processing.process.logger") as mock_logger:
+        apply_tweaks(
+            node,
+            {
+                "database_url": "sqlite:////etc/passwd",
+                "query": "DROP TABLE users",
+                "include_columns": False,
+            },
+        )
+
+    template = node["data"]["node"]["template"]
+    assert template["database_url"]["value"] == "postgresql://stored/db"
+    assert template["query"]["value"] == "SELECT 1"
+    assert template["include_columns"]["value"] is False
+    assert mock_logger.warning.call_args_list == [
+        call("Security: refusing to override protected field 'database_url' via tweaks."),
+        call("Security: refusing to override protected field 'query' via tweaks."),
+    ]
+
+
 def test_apply_tweaks_blocks_code_named_field():
     """The literal 'code' field is blocked, and the warning names the field."""
     node = _template_node({"code": {"value": "original_code", "type": "code"}})
 
     with patch("lfx.processing.process.logger") as mock_logger:
         apply_tweaks(node, {"code": "attempted_injection"})
-        mock_logger.warning.assert_called_once_with("Security: refusing to override code field 'code' via tweaks.")
+        mock_logger.warning.assert_called_once_with("Security: refusing to override protected field 'code' via tweaks.")
 
     assert node["data"]["node"]["template"]["code"]["value"] == "original_code"
 
@@ -73,21 +107,36 @@ def test_apply_tweaks_blocks_python_interpreter_code_and_imports():
     assert node["data"]["node"]["template"]["global_imports"]["value"] == "math"
 
 
+def test_apply_tweaks_blocks_python_function_code_for_all_aliases():
+    """Python Function aliases must not bypass the by-name code-field guard."""
+    for node_type in ("Python Function", "PythonFunction", "PythonFunctionComponent"):
+        node = _template_node(
+            {"function_code": {"value": "def run():\n    return 'safe'", "type": "str"}},
+            node_type=node_type,
+        )
+        apply_tweaks(node, {"function_code": "def run():\n    return __import__('os').system('id')"})
+
+        assert node["data"]["node"]["template"]["function_code"]["value"] == "def run():\n    return 'safe'"
+
+
 def test_apply_tweaks_allows_benign_fields_on_code_execution_component():
     """Scoped block: name/description on a Python REPL tool remain tweakable."""
     node = _template_node(
         {
             "name": {"value": "old_name", "type": "str"},
             "description": {"value": "old desc", "type": "str"},
-            "code": {"value": "print('safe')", "type": "str"},
+            "python_code": {"value": "print('safe')", "type": "str"},
         },
         node_type="PythonREPLTool",
     )
-    apply_tweaks(node, {"name": "new_name", "description": "new desc", "code": "__import__('os').system('id')"})
+    apply_tweaks(
+        node,
+        {"name": "new_name", "description": "new desc", "python_code": "__import__('os').system('id')"},
+    )
 
     assert node["data"]["node"]["template"]["name"]["value"] == "new_name"
     assert node["data"]["node"]["template"]["description"]["value"] == "new desc"
-    assert node["data"]["node"]["template"]["code"]["value"] == "print('safe')"
+    assert node["data"]["node"]["template"]["python_code"]["value"] == "print('safe')"
 
 
 def test_apply_tweaks_blocks_removed_python_code_structured_tool_code():
@@ -99,6 +148,21 @@ def test_apply_tweaks_blocks_removed_python_code_structured_tool_code():
     apply_tweaks(node, {"tool_code": "__import__('os').system('id')"})
 
     assert node["data"]["node"]["template"]["tool_code"]["value"] == "stored_code"
+
+
+def test_apply_tweaks_blocks_csv_agent_dangerous_code_flag():
+    """CSVAgent's LangChain Python-execution opt-in is a sandbox boundary."""
+    node = _template_node(
+        {
+            "allow_dangerous_code": {"value": False, "type": "bool"},
+            "input_value": {"value": "summarize", "type": "str"},
+        },
+        node_type="CSVAgent",
+    )
+    apply_tweaks(node, {"allow_dangerous_code": True, "input_value": "count rows"})
+
+    assert node["data"]["node"]["template"]["allow_dangerous_code"]["value"] is False
+    assert node["data"]["node"]["template"]["input_value"]["value"] == "count rows"
 
 
 def test_apply_tweaks_smart_transform_blocks_instruction_allows_data():
@@ -116,21 +180,112 @@ def test_apply_tweaks_smart_transform_blocks_instruction_allows_data():
     assert node["data"]["node"]["template"]["sample_size"]["value"] == 25
 
 
-# The intended code/sandbox inputs for every code-execution component type, kept
-# independently from the production sets so this test acts as a checksum on the
-# comment-only sync between CODE_EXECUTION_COMPONENT_TYPES and
-# CODE_EXECUTION_FIELD_NAMES (see lfx/utils/flow_validation.py). "code" is the
-# conventional exec input that apply_tweaks() blocks globally by name, so it is
-# allowed here without being listed in CODE_EXECUTION_FIELD_NAMES.
+def test_runtime_file_validation_failure_is_atomic_across_the_graph(monkeypatch):
+    """A later invalid FileInput tweak must not leave any cached vertex half-mutated."""
+    from lfx.processing.process import process_tweaks_on_graph
+    from lfx.utils.file_path_security import LocalFileAccessError
+
+    settings_service = MagicMock()
+    settings_service.settings.restrict_local_file_access = False
+    monkeypatch.setattr("lfx.utils.file_path_security.get_settings_service", lambda: settings_service)
+
+    class _G:
+        user_id = "attacker"
+        flow_id = "attacker-flow"
+        source_flow_id = "trusted-source-flow"
+        vertices = []
+
+    graph = _G()
+
+    def real_shaped(vertex_id, *, load_from_db):
+        vertex = MagicMock(spec=Vertex)
+        vertex.id = vertex_id
+        vertex.graph = graph
+        vertex.data = {
+            "node": {
+                "template": {
+                    "path": {
+                        "type": "file",
+                        "_input_type": "FileInput",
+                        "value": "attacker/original.txt",
+                        "load_from_db": load_from_db,
+                    }
+                }
+            }
+        }
+        vertex.params = {"path": "attacker/original.txt"}
+        vertex.raw_params = {"path": "attacker/original.txt"}
+        vertex.load_from_db_fields = ["path"] if load_from_db else []
+
+        def update_raw_params(new_params, *, overwrite=False):
+            assert overwrite is True
+            validated = ParameterHandler(vertex, storage_service=None).process_runtime_params(dict(new_params))
+            vertex.raw_params.update(validated)
+            vertex.params = vertex.raw_params.copy()
+
+        vertex.update_raw_params.side_effect = update_raw_params
+        return vertex
+
+    safe = real_shaped("safe", load_from_db=False)
+    invalid = real_shaped("invalid", load_from_db=True)
+    graph.vertices = [safe, invalid]
+
+    with pytest.raises(LocalFileAccessError):
+        process_tweaks_on_graph(
+            graph,
+            {
+                "safe": {"path": "trusted-source-flow/source.txt"},
+                "invalid": {"path": {"file_path": r"attacker\..\outside.txt", "load_from_db": False}},
+            },
+        )
+
+    assert safe.raw_params == {"path": "attacker/original.txt"}
+    assert safe.params == {"path": "attacker/original.txt"}
+    assert safe.load_from_db_fields == []
+    assert invalid.raw_params == {"path": "attacker/original.txt"}
+    assert invalid.params == {"path": "attacker/original.txt"}
+    assert invalid.load_from_db_fields == ["path"]
+    safe.update_raw_params.assert_not_called()
+    invalid.update_raw_params.assert_not_called()
+
+
+# The intended code/sandbox inputs for code-execution component types that expose
+# such fields in their templates, kept independently from the production sets so
+# this test acts as a checksum on the comment-only sync between
+# CODE_EXECUTION_COMPONENT_TYPES and CODE_EXECUTION_FIELD_NAMES (see
+# lfx/utils/flow_validation.py). "code" is the conventional exec input that
+# apply_tweaks() blocks globally by name, so it is allowed here without being
+# listed in CODE_EXECUTION_FIELD_NAMES.
+#   - CSVAgent: allow_dangerous_code enables LangChain Python execution
 #   - PythonREPLComponent (Python Interpreter): python_code exec + global_imports sandbox
-#   - PythonREPLTool (Python REPL): code exec (global block) + global_imports sandbox
+#   - PythonREPLTool (Python REPL): python_code exec + global_imports sandbox
+#   - PythonFunctionComponent (Python Function): function_code exec
 #   - Smart Transform (LambdaFilterComponent): filter_instruction → eval()'d lambda
 #   - PythonCodeStructuredTool (removed): tool_code exec input, type retained
 _EXPECTED_CODE_FIELDS_BY_TYPE: dict[str, set[str]] = {
+    "CSVAgent": {"allow_dangerous_code"},
+    "LambdaFilterComponent": {"filter_instruction"},
+    "Python Code Structured": {"tool_code"},
+    "Python Function": {"function_code"},
+    "Python Interpreter": {"python_code", "global_imports"},
+    "Python REPL": {"python_code", "global_imports"},
+    "PythonFunction": {"function_code"},
+    "PythonFunctionComponent": {"function_code"},
     "PythonREPLComponent": {"python_code", "global_imports"},
-    "PythonREPLTool": {"code", "global_imports"},
+    "PythonREPLTool": {"python_code", "global_imports"},
+    "PythonREPLToolComponent": {"python_code", "global_imports"},
     "Smart Transform": {"filter_instruction"},
     "PythonCodeStructuredTool": {"tool_code"},
+}
+
+# Code-execution components with no tweakable code/sandbox field. They are still
+# blocked on unauthenticated public builds by CODE_EXECUTION_COMPONENT_TYPES.
+_CODE_EXECUTION_TYPES_WITHOUT_TWEAK_CODE_FIELDS = {
+    "CodeAct Agent (Smolagents)",
+    "CodeActAgentSmolagents",
+    "Cuga",
+    "OpenDsStar Agent",
+    "OpenDsStarAgent",
 }
 
 # Field name globally blocked by apply_tweaks() regardless of component type.
@@ -140,16 +295,17 @@ _GLOBALLY_BLOCKED_FIELD = "code"
 def test_every_code_execution_type_has_registered_code_fields():
     """Tripwire: each registered code-exec type must declare its code fields here.
 
-    Forcing function for the "next person" who adds a fifth code-execution
-    component: adding a type to CODE_EXECUTION_COMPONENT_TYPES without an entry
-    here fails immediately, and the coverage assert below then fails until the
-    type's code input is actually added to CODE_EXECUTION_FIELD_NAMES. This is
-    what keeps the by-name half of the guard from silently going stale, since the
-    component classes themselves aren't importable in this unit env (optional deps).
+    Forcing function for the next code-execution component: adding a type to
+    CODE_EXECUTION_COMPONENT_TYPES without either registered code/sandbox fields
+    or an explicit no-field entry fails immediately. This keeps the by-name half
+    of the guard from silently going stale, since the component classes themselves
+    aren't importable in this unit env (optional deps).
     """
-    assert set(_EXPECTED_CODE_FIELDS_BY_TYPE) == set(CODE_EXECUTION_COMPONENT_TYPES), (
+    expected_component_types = set(_EXPECTED_CODE_FIELDS_BY_TYPE) | _CODE_EXECUTION_TYPES_WITHOUT_TWEAK_CODE_FIELDS
+    assert expected_component_types == set(CODE_EXECUTION_COMPONENT_TYPES), (
         "CODE_EXECUTION_COMPONENT_TYPES changed without updating _EXPECTED_CODE_FIELDS_BY_TYPE. "
-        "Register the new component's code/sandbox input field name(s) so the Tweaks guard covers it."
+        "Register the new component's code/sandbox input field name(s), or explicitly mark it as a "
+        "runtime code-execution component with no tweakable code/sandbox fields."
     )
 
     covered = set(CODE_EXECUTION_FIELD_NAMES) | {_GLOBALLY_BLOCKED_FIELD}
